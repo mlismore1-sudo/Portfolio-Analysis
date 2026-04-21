@@ -30,17 +30,19 @@ COLUMN_ALIASES = {
     "gbp_value": ["gbp value", "market value", "value", "market value gbp", "gbp_market_value"],
 }
 
-MANUAL_MAPPING = {
-    "AAPL": {"matched_ticker": "AAPL", "asset_class": "Equity", "region": "North America"},
-    "MSFT": {"matched_ticker": "MSFT", "asset_class": "Equity", "region": "North America"},
-    "VUSA.L": {"matched_ticker": "VUSA.L", "asset_class": "Equity", "region": "North America"},
-    "VUKE.L": {"matched_ticker": "VUKE.L", "asset_class": "Equity", "region": "UK"},
-    "VEUR.L": {"matched_ticker": "VEUR.L", "asset_class": "Equity", "region": "Europe (excluding UK)"},
-    "VJPN.L": {"matched_ticker": "VJPN.L", "asset_class": "Equity", "region": "Japan"},
-    "VWRL.L": {"matched_ticker": "VWRL.L", "asset_class": "Equity", "region": "Rest of World"},
-    "IGLS.L": {"matched_ticker": "IGLS.L", "asset_class": "Bonds", "region": "UK"},
-    "CASHGBP": {"matched_ticker": None, "asset_class": "Cash", "region": "UK"},
-    "GOLDLN": {"matched_ticker": None, "asset_class": "Alternatives", "region": "Rest of World"},
+MANUAL_EXCEPTIONS = {
+    "CASHGBP": {
+        "matched_ticker": None,
+        "asset_class": "Cash",
+        "region": "UK",
+        "match_status": "Manual exception",
+    },
+    "GBP CASH": {
+        "matched_ticker": None,
+        "asset_class": "Cash",
+        "region": "UK",
+        "match_status": "Manual exception",
+    },
 }
 
 
@@ -99,26 +101,15 @@ def parse_uploaded_holdings(uploaded_file):
     return parsed
 
 
-def resolve_holdings(df):
-    out = df.copy()
-
-    out["matched_ticker"] = out["identifier"].map(
-        lambda x: MANUAL_MAPPING.get(x, {}).get(
-            "matched_ticker",
-            x if detect_identifier_type(x) == "Ticker" else None
-        )
-    )
-    out["asset_class"] = out["identifier"].map(
-        lambda x: MANUAL_MAPPING.get(x, {}).get("asset_class", "Unclassified")
-    )
-    out["region"] = out["identifier"].map(
-        lambda x: MANUAL_MAPPING.get(x, {}).get("region", "Unclassified")
-    )
-    out["match_status"] = out["matched_ticker"].apply(
-        lambda x: "Matched" if pd.notna(x) and str(x).strip() != "" else "Unresolved"
-    )
-
-    return out
+@st.cache_data(show_spinner=False)
+def get_ticker_metadata(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        if not isinstance(info, dict):
+            return {}
+        return info
+    except Exception:
+        return {}
 
 
 @st.cache_data(show_spinner=False)
@@ -129,13 +120,16 @@ def get_price_history(ticker: str, years: int):
     end_date = date.today()
     start_date = end_date - timedelta(days=365 * years + 10)
 
-    data = yf.download(
-        ticker,
-        start=start_date,
-        end=end_date,
-        auto_adjust=True,
-        progress=False,
-    )
+    try:
+        data = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        return pd.Series(dtype=float)
 
     if data.empty:
         return pd.Series(dtype=float)
@@ -145,6 +139,127 @@ def get_price_history(ticker: str, years: int):
         close_series = close_series.squeeze()
 
     return close_series
+
+
+def map_country_to_region(country):
+    if not country:
+        return "Unclassified"
+
+    country = str(country).strip().lower()
+
+    north_america = {
+        "united states", "usa", "us", "canada", "mexico"
+    }
+    uk = {
+        "united kingdom", "uk", "great britain", "england", "scotland", "wales", "northern ireland"
+    }
+    europe_ex_uk = {
+        "france", "germany", "switzerland", "netherlands", "sweden", "norway",
+        "denmark", "finland", "italy", "spain", "belgium", "austria", "ireland",
+        "portugal", "luxembourg", "poland"
+    }
+    japan = {"japan"}
+
+    if country in north_america:
+        return "North America"
+    if country in uk:
+        return "UK"
+    if country in europe_ex_uk:
+        return "Europe (excluding UK)"
+    if country in japan:
+        return "Japan"
+
+    return "Rest of World"
+
+
+def map_quote_type_to_asset_class(quote_type, sector, long_name):
+    qt = str(quote_type).strip().upper() if quote_type else ""
+    sector = str(sector).strip().lower() if sector else ""
+    long_name = str(long_name).strip().lower() if long_name else ""
+
+    if qt in {"EQUITY", "ETF", "MUTUALFUND"}:
+        if "bond" in long_name or sector == "fixed income":
+            return "Bonds"
+        return "Equity"
+
+    if qt in {"BOND"}:
+        return "Bonds"
+
+    if "bond" in long_name:
+        return "Bonds"
+    if "gold" in long_name or "commodity" in long_name:
+        return "Alternatives"
+
+    return "Unclassified"
+
+
+def resolve_single_holding(identifier, description):
+    identifier = str(identifier).strip()
+    description = str(description).strip()
+
+    if identifier in MANUAL_EXCEPTIONS:
+        manual = MANUAL_EXCEPTIONS[identifier]
+        return {
+            "matched_ticker": manual["matched_ticker"],
+            "asset_class": manual["asset_class"],
+            "region": manual["region"],
+            "match_status": manual["match_status"],
+            "metadata_country": None,
+            "metadata_quote_type": None,
+        }
+
+    identifier_type = detect_identifier_type(identifier)
+
+    if identifier_type != "Ticker":
+        return {
+            "matched_ticker": None,
+            "asset_class": "Unclassified",
+            "region": "Unclassified",
+            "match_status": f"{identifier_type} not resolved",
+            "metadata_country": None,
+            "metadata_quote_type": None,
+        }
+
+    info = get_ticker_metadata(identifier)
+
+    if not info:
+        return {
+            "matched_ticker": identifier,
+            "asset_class": "Unclassified",
+            "region": "Unclassified",
+            "match_status": "Ticker found, metadata missing",
+            "metadata_country": None,
+            "metadata_quote_type": None,
+        }
+
+    country = info.get("country")
+    quote_type = info.get("quoteType")
+    sector = info.get("sector")
+    long_name = info.get("longName") or info.get("shortName") or description
+
+    region = map_country_to_region(country)
+    asset_class = map_quote_type_to_asset_class(quote_type, sector, long_name)
+
+    return {
+        "matched_ticker": identifier,
+        "asset_class": asset_class,
+        "region": region,
+        "match_status": "Yahoo Finance metadata",
+        "metadata_country": country,
+        "metadata_quote_type": quote_type,
+    }
+
+
+def resolve_holdings(df):
+    records = []
+
+    for _, row in df.iterrows():
+        resolved = resolve_single_holding(row["identifier"], row["description"])
+        merged = row.to_dict()
+        merged.update(resolved)
+        records.append(merged)
+
+    return pd.DataFrame(records)
 
 
 def calculate_asset_allocation(df):
@@ -168,7 +283,7 @@ def calculate_region_allocation(df):
 
 
 def calculate_portfolio_trailing_returns(df):
-    matched = df[df["match_status"] == "Matched"].copy()
+    matched = df[df["matched_ticker"].notna()].copy()
 
     if matched.empty:
         return pd.DataFrame(
@@ -215,7 +330,7 @@ def to_csv_bytes(df):
 
 st.title("Investment Portfolio Analysis Tool")
 st.write(
-    "Upload a CSV of your holdings, confirm the extraction, then generate allocation, return, and geographic insights."
+    "Upload a CSV of your holdings, confirm the extraction, then generate allocation, return, and geographic insights using Yahoo Finance metadata where available."
 )
 
 with st.expander("Expected CSV format"):
@@ -229,8 +344,8 @@ with st.expander("Expected CSV format"):
         Example:
         ```csv
         Ticker,Description,GBP Value
-        VUSA.L,Vanguard S&P 500 UCITS ETF,25000
-        VUKE.L,Vanguard FTSE 100 UCITS ETF,10000
+        PYPL,PayPal Holdings Inc,5000
+        CROX,Crocs Inc,3000
         ```
         """
     )
@@ -257,16 +372,19 @@ if uploaded_file is not None:
         st.error(f"Could not parse file: {e}")
 
 if st.session_state.confirmed and st.session_state.parsed_df is not None:
-    enriched_df = resolve_holdings(st.session_state.parsed_df)
+    with st.spinner("Resolving holdings and fetching Yahoo Finance metadata..."):
+        enriched_df = resolve_holdings(st.session_state.parsed_df)
 
     st.subheader("Step 2: Enriched holdings")
     st.dataframe(enriched_df, use_container_width=True)
 
-    unresolved = enriched_df[enriched_df["match_status"] != "Matched"]
+    unresolved = enriched_df[
+        (enriched_df["region"] == "Unclassified") | (enriched_df["asset_class"] == "Unclassified")
+    ]
     if not unresolved.empty:
         st.warning(
-            f"{len(unresolved)} holding(s) could not be matched to price history. "
-            "They will still appear in allocation outputs, but may be excluded from return calculations."
+            f"{len(unresolved)} holding(s) could not be fully classified from Yahoo Finance metadata. "
+            "They are still included, but some values may remain Unclassified."
         )
 
     asset_alloc_df = calculate_asset_allocation(enriched_df)
